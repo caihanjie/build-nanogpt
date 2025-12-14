@@ -7,12 +7,20 @@ $ python fineweb.py
 Will save shards to the local directory "edu_fineweb10B".
 """
 
+#LD_LIBRARY_PATH=/home/chj/anaconda3/lib:$LD_LIBRARY_PATH /home/chj/anaconda3/bin/python fineweb.py
+
 import os
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+
+# os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"   # 国内镜像
+
+
 import multiprocessing as mp
 import numpy as np
 import tiktoken
 from datasets import load_dataset # pip install datasets
 from tqdm import tqdm # pip install tqdm
+
 
 # ------------------------------------------
 local_dir = "edu_fineweb10B"

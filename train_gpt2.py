@@ -2,6 +2,7 @@ import os
 import math
 import time
 import inspect
+import random
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -251,6 +252,23 @@ class DataLoaderLite:
             self.current_position = B * T * self.process_rank
         return x, y
 
+    def state_dict(self):
+        base_position = self.current_position - (self.B * self.T * self.process_rank)
+        return {
+            'current_shard': self.current_shard,
+            'base_position': base_position,
+        }
+
+    def load_state_dict(self, state):
+        shard = int(state.get('current_shard', 0)) % len(self.shards)
+        base_position = int(state.get('base_position', 0))
+        self.current_shard = shard
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = base_position + (self.B * self.T * self.process_rank)
+        max_pos = max(len(self.tokens) - (self.B * self.T * self.num_processes + 1), 0)
+        if self.current_position > max_pos:
+            self.current_position = max_pos if max_pos > 0 else self.B * self.T * self.process_rank
+
 # -----------------------------------------------------------------------------
 # helper function for HellaSwag eval
 # takes tokens, mask, and logits, returns the index of the completion with the lowest loss
@@ -322,7 +340,7 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size
+B = 16 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -366,14 +384,37 @@ def get_lr(it):
 # optimize!
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
-# create the log directory we will write checkpoints to and log to
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
+resume_path = os.environ.get("RESUME_FROM", None)
+start_step = 0
+if resume_path is not None:
+    if not os.path.exists(resume_path):
+        raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
+    checkpoint = torch.load(resume_path, map_location=device)
+    raw_model.load_state_dict(checkpoint['model'])
+    if 'optimizer' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+    if 'train_loader_state' in checkpoint:
+        train_loader.load_state_dict(checkpoint['train_loader_state'])
+    if 'rng_state' in checkpoint:
+        torch.set_rng_state(checkpoint['rng_state'])
+    if device_type == "cuda" and checkpoint.get('cuda_rng_state') is not None:
+        torch.cuda.set_rng_state_all(checkpoint['cuda_rng_state'])
+    if 'numpy_rng_state' in checkpoint:
+        np.random.set_state(checkpoint['numpy_rng_state'])
+    if 'python_rng_state' in checkpoint:
+        random.setstate(checkpoint['python_rng_state'])
+    start_step = int(checkpoint.get('step', 0))
+    if master_process:
+        print(f"resumed from checkpoint {resume_path} at step {start_step}")
+
 log_file = os.path.join(log_dir, f"log.txt")
-with open(log_file, "w") as f: # open for writing to clear the file
+log_mode = "a" if resume_path else "w"
+with open(log_file, log_mode) as f:
     pass
 
-for step in range(max_steps):
+for step in range(start_step, max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
@@ -397,18 +438,22 @@ for step in range(max_steps):
             print(f"validation loss: {val_loss_accum.item():.4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-            if step > 0 and (step % 5000 == 0 or last_step):
-                # optionally write model checkpoints
+            if step > 0 and (step % 2000 == 0 or last_step):
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
                 checkpoint = {
                     'model': raw_model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
                     'config': raw_model.config,
                     'step': step,
-                    'val_loss': val_loss_accum.item()
+                    'val_loss': val_loss_accum.item(),
+                    'train_loader_state': train_loader.state_dict(),
+                    'rng_state': torch.get_rng_state(),
+                    'cuda_rng_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                    'numpy_rng_state': np.random.get_state(),
+                    'python_rng_state': random.getstate(),
                 }
-                # you might also want to add optimizer.state_dict() and
-                # rng seeds etc., if you wanted to more exactly resume training
                 torch.save(checkpoint, checkpoint_path)
+                torch.save(checkpoint, os.path.join(log_dir, "model_latest.pt"))
 
     # once in a while evaluate hellaswag
     if (step % 250 == 0 or last_step) and (not use_compile):

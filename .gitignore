@@ -1,0 +1,8 @@
+# HuggingFace cache
+hf-cache/
+**/.locks/
+*.lock
+
+# dataset / numpy shards
+edu_fineweb10B/
+*.npy
