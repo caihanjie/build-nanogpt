@@ -4,6 +4,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 import tiktoken
 
+#python generate_gpt2.py --checkpoint log/model_latest.pt --prompt "hello，" --max-new-tokens 80 --num-return-sequences 2
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
